@@ -146,6 +146,106 @@ flowchart LR
 
 ---
 
+## Request flow: browser → AI → database
+
+One search, end to end. Each frame is one layer, and each sticky note is one real step in the code.
+Solid arrows are control flow. Dotted arrows are SQL queries into the database, and the daily build that ships it.
+
+```mermaid
+flowchart TB
+  classDef sticky fill:#fff4b8,stroke:#e0c34a,color:#222,rx:6,ry:6
+  classDef ai fill:#ffd9c7,stroke:#ff5a1f,color:#222,rx:6,ry:6
+  classDef data fill:#d7f2e3,stroke:#3aa66b,color:#222,rx:6,ry:6
+  classDef net fill:#e6e9ff,stroke:#6b75d9,color:#222,rx:6,ry:6
+  classDef decide fill:#ffffff,stroke:#888,color:#222
+  classDef done fill:#222,stroke:#222,color:#fff
+
+  subgraph L1["① Browser · components/JobsApp.tsx"]
+    direction LR
+    U((👩‍🎓 User types<br/>'pune me backend internship')):::sticky
+    DB1[280 ms debounce<br/>abort the previous fetch]:::sticky
+    REQ[HTTPS GET<br/>/api/search?q=…]:::sticky
+    U --> DB1 --> REQ
+  end
+
+  subgraph L2["② Network · Vercel edge"]
+    direction LR
+    DNS[DNS + TLS 1.3<br/>nearest PoP]:::net
+    CDN{same URL cached<br/>since last deploy?}:::decide
+    DNS --> CDN
+  end
+
+  subgraph L3["③ App · Next.js route, Node 24, bom1 · app/api/search/route.ts"]
+    direction LR
+    RL{per-IP token bucket<br/>≤ 120 req/min?}:::decide
+    PP[parseParams<br/>q · role · city · type · mode · page]:::sticky
+    RL -- yes --> PP
+  end
+
+  subgraph L4["④ AI layer · query understanding · lib/understand.ts + lib/search.ts"]
+    direction TB
+    NLU[understandRules<br/>phrases · city aliases · role words<br/>0 tokens · under 1 ms]:::ai
+    Z1{0 rows and<br/>2+ words?}:::decide
+    LRU{rewrite in<br/>instance LRU?}:::decide
+    GEM[Gemini flash-lite<br/>JSON schema, closed enums<br/>temp 0 · 2.5 s timeout]:::ai
+    VAL[keep only known<br/>roles and cities]:::ai
+    Z2{still 0 rows?}:::decide
+    LAD[relaxation ladder<br/>any keyword → no keywords → … → no role<br/>each dropped filter is reported]:::ai
+    NLU --> Z1
+    Z1 -- yes --> LRU
+    LRU -- no --> GEM --> VAL
+    LRU -- yes --> VAL
+    VAL --> Z2
+    Z1 -- no --> Z2
+    Z2 -- yes --> LAD
+  end
+
+  subgraph L5["⑤ Database · SQLite FTS5 file inside the function · lib/db.ts"]
+    direction LR
+    SQL[(beep-jobs.db<br/>read-only, in-process<br/>no network hop)]:::data
+    Q1[posts + post_city<br/>WHERE role, city, verdict]:::data
+    Q2[fts MATCH terms<br/>ORDER BY bm25 8·4·3·3·3·1]:::data
+    Q3[facet counts<br/>GROUP BY role, city, …]:::data
+    SQL --- Q1 --- Q2 --- Q3
+  end
+
+  subgraph L6["⑥ Response"]
+    direction LR
+    JS[200 JSON: hits + receipts<br/>+ understood + relaxed + facets<br/>server-timing: db ≈ 3 ms]:::sticky
+    CC[cache-control:<br/>s-maxage=3600<br/>stale-while-revalidate=86400]:::net
+    UI[render job cards<br/>with verbatim receipts]:::done
+    JS --> CC --> UI
+  end
+
+  subgraph OFF["🌙 Done earlier by the daily pipeline, not per request"]
+    direction LR
+    TAG[Gemini tagger<br/>role · city · years + quotes]:::ai
+    VER[receipt verifier<br/>quote ⊂ post text?]:::ai
+    BLD[build step<br/>posts.jsonl → beep-jobs.db]:::data
+    TAG --> VER --> BLD
+  end
+
+  REQ --> DNS
+  CDN -->|HIT · 20 to 60 ms| UI
+  CDN -- MISS --> RL
+  RL -- no --> R429[429 rate_limited<br/>retry-after: 60]:::done
+  PP --> NLU
+  NLU -. filters .-> SQL
+  VAL -. LLM filters .-> SQL
+  LAD -. looser filters .-> SQL
+  Z2 -- no --> JS
+  LAD --> JS
+  BLD -. ships inside every deploy .-> SQL
+```
+
+**How to read it**
+
+- **AI runs at two times.** At request time it only turns the user's words into filters (④). At pipeline time it reads every post and writes the tags and receipts (🌙). So the search itself never waits on a model to read job posts.
+- **The LLM is the second choice, not the first.** Rules handle most queries for 0 tokens. Gemini is called only when rules find 0 rows for a query of 2+ words, and a 2.5 s timeout means a slow model never blocks the page.
+- **The database is a file, not a server.** Every function instance opens its own read-only copy of `beep-jobs.db`. There is no connection pool to exhaust and no network call to the data.
+
+---
+
 ## Runtime topology: how one request travels
 
 ```mermaid
